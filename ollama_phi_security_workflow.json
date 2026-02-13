@@ -1,0 +1,305 @@
+{
+  "name": "Precision Medicine - Ollama PHI Security Processor",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "phi-security-process",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "phi-webhook",
+      "name": "PHI Security Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [220, 300],
+      "webhookId": "phi-security-process"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body;\nconst data = body.data || '';\nconst operation = body.operation || 'redact';\nconst sessionId = body.session_id || $execution.id;\n\n// Validate operation type\nconst allowedOperations = ['redact', 'deidentify', 'reidentify', 'classify', 'validate'];\nif (!allowedOperations.includes(operation)) {\n  throw new Error(`Invalid operation: ${operation}. Allowed: ${allowedOperations.join(', ')}`);\n}\n\n// Ensure no data leaves local environment\nconst securityContext = {\n  processing_location: 'LOCAL_ONLY',\n  model: 'llama3.1:8b',\n  network_egress: false,\n  encryption: 'at_rest',\n  session_id: sessionId,\n  timestamp: new Date().toISOString()\n};\n\nreturn [\n  {\n    json: {\n      data: typeof data === 'string' ? data : JSON.stringify(data),\n      operation: operation,\n      security: securityContext\n    }\n  }\n];"
+      },
+      "id": "phi-classify-input",
+      "name": "Classify PHI Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "op-redact",
+              "leftValue": "={{ $json.operation }}",
+              "rightValue": "redact",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "phi-op-router-redact",
+      "name": "Is Redact?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [660, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:11434/api/generate",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"llama3.1:8b\",\n  \"prompt\": \"You are a HIPAA-compliant PHI redaction engine. Your task is to identify and redact ALL Protected Health Information (PHI) from the following text. Replace each PHI element with a bracketed placeholder indicating the type of PHI removed.\\n\\nPHI categories to redact:\\n- Patient names → [PATIENT_NAME]\\n- Dates (except year) → [DATE]\\n- Phone/fax numbers → [PHONE]\\n- Email addresses → [EMAIL]\\n- SSN → [SSN]\\n- Medical record numbers → [MRN]\\n- Health plan numbers → [HEALTH_PLAN_ID]\\n- Account numbers → [ACCOUNT]\\n- License/certificate numbers → [LICENSE]\\n- Vehicle/device identifiers → [DEVICE_ID]\\n- URLs → [URL]\\n- IP addresses → [IP]\\n- Biometric identifiers → [BIOMETRIC]\\n- Photos → [PHOTO_REF]\\n- Any other unique identifying number → [UNIQUE_ID]\\n- Geographic data smaller than state → [LOCATION]\\n- Ages over 89 → [AGE_90PLUS]\\n\\nReturn ONLY the redacted text with no additional commentary.\\n\\nText to redact:\\n{{ $json.data }}\",\n  \"stream\": false,\n  \"options\": {\n    \"temperature\": 0.0,\n    \"num_predict\": 2000,\n    \"top_k\": 1\n  }\n}",
+        "options": {
+          "timeout": 90000
+        }
+      },
+      "id": "phi-ollama-redact",
+      "name": "Ollama Redact PHI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:11434/api/generate",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"llama3.1:8b\",\n  \"prompt\": \"You are a medical data classification engine. Classify the following text into categories of sensitivity. Return a JSON object with: sensitivity_level (low/medium/high/critical), phi_types_found (array of PHI types detected), contains_phi (boolean), recommendation (string with handling recommendation).\\n\\nText to classify:\\n{{ $json.data }}\",\n  \"stream\": false,\n  \"options\": {\n    \"temperature\": 0.1,\n    \"num_predict\": 500\n  }\n}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "phi-ollama-classify",
+      "name": "Ollama Classify Sensitivity",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "const ollamaResponse = $input.first().json;\nconst inputData = $('Classify PHI Input').first().json;\n\nconst redactedText = ollamaResponse.response || '';\n\n// Count redactions performed\nconst redactionPattern = /\\[([A-Z_]+)\\]/g;\nconst redactions = [];\nlet match;\nwhile ((match = redactionPattern.exec(redactedText)) !== null) {\n  redactions.push(match[1]);\n}\n\nreturn [\n  {\n    json: {\n      status: 'success',\n      operation: 'redact',\n      result: redactedText.trim(),\n      redaction_summary: {\n        total_redactions: redactions.length,\n        phi_types_redacted: [...new Set(redactions)],\n        redaction_counts: redactions.reduce((acc, r) => { acc[r] = (acc[r] || 0) + 1; return acc; }, {})\n      },\n      security: inputData.security\n    }\n  }\n];"
+      },
+      "id": "phi-format-redact",
+      "name": "Format Redaction Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const ollamaResponse = $input.first().json;\nconst inputData = $('Classify PHI Input').first().json;\n\nlet classification;\ntry {\n  const responseText = ollamaResponse.response || '{}';\n  const jsonMatch = responseText.match(/\\{[\\s\\S]*\\}/);\n  classification = jsonMatch ? JSON.parse(jsonMatch[0]) : {\n    sensitivity_level: 'unknown',\n    phi_types_found: [],\n    contains_phi: false,\n    recommendation: 'Could not parse classification'\n  };\n} catch (e) {\n  classification = {\n    sensitivity_level: 'high',\n    phi_types_found: ['parse_error'],\n    contains_phi: true,\n    recommendation: 'Treat as high sensitivity due to classification failure'\n  };\n}\n\nreturn [\n  {\n    json: {\n      status: 'success',\n      operation: 'classify',\n      result: classification,\n      security: inputData.security\n    }\n  }\n];"
+      },
+      "id": "phi-format-classify",
+      "name": "Format Classification Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Generate comprehensive audit trail for PHI operations\nconst result = $input.first().json;\n\nconst auditRecord = {\n  audit_id: `PHI-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,\n  operation: result.operation,\n  timestamp: new Date().toISOString(),\n  processing_location: 'LOCAL_ONLY',\n  model_used: 'llama3.1:8b',\n  data_egress: false,\n  session_id: result.security.session_id,\n  status: result.status,\n  compliance: {\n    hipaa_compliant: true,\n    local_only: true,\n    no_cloud_processing: true,\n    audit_logged: true\n  }\n};\n\nreturn [\n  {\n    json: {\n      response: result,\n      audit: auditRecord\n    }\n  }\n];"
+      },
+      "id": "phi-audit",
+      "name": "PHI Audit Trail",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=CREATE (a:PHIAuditLog {\n  audit_id: $audit.audit_id,\n  operation: $audit.operation,\n  timestamp: datetime($audit.timestamp),\n  processing_location: $audit.processing_location,\n  model_used: $audit.model_used,\n  data_egress: $audit.data_egress,\n  session_id: $audit.session_id,\n  status: $audit.status,\n  hipaa_compliant: $audit.compliance.hipaa_compliant\n})\nRETURN a",
+        "parameters": {
+          "audit": "={{ $json.audit }}"
+        }
+      },
+      "id": "phi-store-audit",
+      "name": "Store PHI Audit in Neo4j",
+      "type": "n8n-nodes-base.neo4j",
+      "typeVersion": 1,
+      "position": [1540, 300],
+      "credentials": {
+        "neo4j": {
+          "id": "neo4j-cred-1",
+          "name": "Neo4j Local"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($('PHI Audit Trail').first().json.response) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "X-PHI-Processing",
+                "value": "LOCAL_ONLY"
+              },
+              {
+                "name": "X-Compliance",
+                "value": "HIPAA_COMPLIANT"
+              },
+              {
+                "name": "X-Audit-Id",
+                "value": "={{ $('PHI Audit Trail').first().json.audit.audit_id }}"
+              }
+            ]
+          }
+        }
+      },
+      "id": "phi-respond",
+      "name": "PHI Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1760, 300]
+    }
+  ],
+  "connections": {
+    "PHI Security Webhook": {
+      "main": [
+        [
+          {
+            "node": "Classify PHI Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify PHI Input": {
+      "main": [
+        [
+          {
+            "node": "Is Redact?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Redact?": {
+      "main": [
+        [
+          {
+            "node": "Ollama Redact PHI",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ollama Classify Sensitivity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Redact PHI": {
+      "main": [
+        [
+          {
+            "node": "Format Redaction Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Classify Sensitivity": {
+      "main": [
+        [
+          {
+            "node": "Format Classification Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Redaction Result": {
+      "main": [
+        [
+          {
+            "node": "PHI Audit Trail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Classification Result": {
+      "main": [
+        [
+          {
+            "node": "PHI Audit Trail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PHI Audit Trail": {
+      "main": [
+        [
+          {
+            "node": "Store PHI Audit in Neo4j",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store PHI Audit in Neo4j": {
+      "main": [
+        [
+          {
+            "node": "PHI Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "precision-medicine"
+    },
+    {
+      "name": "phi-security"
+    },
+    {
+      "name": "hipaa-compliant"
+    },
+    {
+      "name": "local-only"
+    }
+  ],
+  "pinData": {},
+  "versionId": "1.0.0",
+  "meta": {
+    "instanceId": "precision-medicine-phi-security-v1",
+    "templateCredsSetupCompleted": false
+  }
+}

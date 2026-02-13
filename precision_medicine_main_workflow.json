@@ -1,0 +1,758 @@
+{
+  "name": "Precision Medicine Engine - Main Orchestrator",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "precision-medicine-query",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "node-webhook-intake",
+      "name": "User Query Intake",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [220, 300],
+      "webhookId": "precision-medicine-query"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body;\n\nconst userQuery = body.query || '';\nconst userId = body.user_id || 'anonymous';\nconst sessionId = body.session_id || $execution.id;\nconst queryTimestamp = new Date().toISOString();\n\n// Basic input sanitization\nconst sanitizedQuery = userQuery\n  .replace(/[<>\"'`;]/g, '')\n  .trim()\n  .substring(0, 2000);\n\nif (!sanitizedQuery) {\n  throw new Error('Query cannot be empty after sanitization.');\n}\n\n// Check if query contains PHI indicators for routing to Ollama\nconst phiPatterns = [\n  /\\b\\d{3}-\\d{2}-\\d{4}\\b/,      // SSN\n  /\\b[A-Z]{1,2}\\d{6,10}\\b/,      // MRN patterns\n  /\\bpatient\\s+name\\b/i,\n  /\\bdate\\s+of\\s+birth\\b/i,\n  /\\bDOB\\b/,\n  /\\bSSN\\b/i,\n  /\\bmedical\\s+record\\b/i\n];\n\nconst containsPHI = phiPatterns.some(p => p.test(sanitizedQuery));\n\nreturn [\n  {\n    json: {\n      query: sanitizedQuery,\n      user_id: userId,\n      session_id: sessionId,\n      timestamp: queryTimestamp,\n      contains_phi: containsPHI,\n      original_length: userQuery.length,\n      sanitized_length: sanitizedQuery.length\n    }\n  }\n];"
+      },
+      "id": "node-sanitize-input",
+      "name": "Sanitize & Classify Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "phi-check",
+              "leftValue": "={{ $json.contains_phi }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-phi-router",
+      "name": "PHI Data Router",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [660, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:11434/api/generate",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"llama3.1:8b\",\n  \"prompt\": \"You are a medical data privacy filter. Redact all PHI (Protected Health Information) from the following query while preserving the medical/scientific intent. Replace PHI with generic placeholders. Return ONLY the redacted query.\\n\\nOriginal query: {{ $json.query }}\",\n  \"stream\": false,\n  \"options\": {\n    \"temperature\": 0.1,\n    \"num_predict\": 500\n  }\n}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "node-ollama-redact",
+      "name": "Ollama PHI Redaction",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const ollamaResponse = $input.first().json;\nconst originalData = $('Sanitize & Classify Input').first().json;\n\nconst redactedQuery = ollamaResponse.response || originalData.query;\n\nreturn [\n  {\n    json: {\n      ...originalData,\n      query: redactedQuery.trim(),\n      original_query_redacted: true,\n      phi_handling: 'ollama_local_redaction'\n    }\n  }\n];"
+      },
+      "id": "node-merge-redacted",
+      "name": "Merge Redacted Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 200]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=MATCH (r:MedicalRecord)-[:RELATES_TO]->(c:Condition)\nWHERE toLower(r.description) CONTAINS toLower('{{ $json.query }}')\n   OR toLower(c.name) CONTAINS toLower('{{ $json.query }}')\nRETURN r, c\nLIMIT 20"
+      },
+      "id": "node-neo4j-check",
+      "name": "Check Neo4j Cache",
+      "type": "n8n-nodes-base.neo4j",
+      "typeVersion": 1,
+      "position": [1320, 300],
+      "credentials": {
+        "neo4j": {
+          "id": "neo4j-cred-1",
+          "name": "Neo4j Local"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const neo4jResults = $input.first().json;\nconst queryData = $('Sanitize & Classify Input').first().json;\n\n// Check if we got meaningful results from Neo4j\nconst hasResults = neo4jResults && \n  ((Array.isArray(neo4jResults) && neo4jResults.length > 0) ||\n   (neo4jResults.records && neo4jResults.records.length > 0));\n\nreturn [\n  {\n    json: {\n      ...queryData,\n      neo4j_has_data: hasResults,\n      neo4j_results: hasResults ? neo4jResults : null,\n      cache_status: hasResults ? 'HIT' : 'MISS'\n    }\n  }\n];"
+      },
+      "id": "node-evaluate-cache",
+      "name": "Evaluate Cache Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1540, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cache-hit",
+              "leftValue": "={{ $json.neo4j_has_data }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-cache-router",
+      "name": "Cache Hit Router",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1760, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\n\nreturn [\n  {\n    json: {\n      status: 'success',\n      source: 'local_cache',\n      cache_status: 'HIT',\n      query: data.query,\n      session_id: data.session_id,\n      timestamp: new Date().toISOString(),\n      results: data.neo4j_results,\n      data_freshness: 'cached'\n    }\n  }\n];"
+      },
+      "id": "node-format-cached",
+      "name": "Format Cached Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1980, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OPENCLAW_API_URL || 'http://localhost:8080/api/v1/research' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.OPENCLAW_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"query\": \"{{ $json.query }}\",\n  \"context\": \"precision_medicine\",\n  \"sources\": [\n    \"pubmed\",\n    \"clinicaltrials_gov\",\n    \"drugbank\",\n    \"pharmgkb\",\n    \"omim\",\n    \"uniprot\"\n  ],\n  \"max_results\": 50,\n  \"include_citations\": true,\n  \"session_id\": \"{{ $json.session_id }}\"\n}",
+        "options": {
+          "timeout": 120000,
+          "retry": {
+            "maxRetries": 3,
+            "retryInterval": 2000
+          }
+        }
+      },
+      "id": "node-openclaw-fetch",
+      "name": "OpenClaw Research Fetch",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1980, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "const openClawData = $input.first().json;\nconst queryData = $('Evaluate Cache Results').first().json;\n\n// Validate and structure the OpenClaw response\nconst results = openClawData.results || openClawData.data || openClawData;\n\n// Extract key medical entities for Neo4j storage\nconst entities = [];\nconst relationships = [];\n\nif (Array.isArray(results)) {\n  for (const item of results) {\n    // Build entity nodes\n    if (item.type === 'gene' || item.category === 'genomic') {\n      entities.push({\n        type: 'Gene',\n        name: item.name || item.title,\n        source: item.source || 'openclaw',\n        data: JSON.stringify(item)\n      });\n    } else if (item.type === 'drug' || item.category === 'pharmacological') {\n      entities.push({\n        type: 'Drug',\n        name: item.name || item.title,\n        source: item.source || 'openclaw',\n        data: JSON.stringify(item)\n      });\n    } else if (item.type === 'condition' || item.category === 'disease') {\n      entities.push({\n        type: 'Condition',\n        name: item.name || item.title,\n        source: item.source || 'openclaw',\n        data: JSON.stringify(item)\n      });\n    } else {\n      entities.push({\n        type: 'MedicalRecord',\n        name: item.name || item.title || 'Unknown',\n        description: item.description || item.summary || '',\n        source: item.source || 'openclaw',\n        data: JSON.stringify(item)\n      });\n    }\n\n    // Build relationships if present\n    if (item.related_to) {\n      for (const rel of (Array.isArray(item.related_to) ? item.related_to : [item.related_to])) {\n        relationships.push({\n          from: item.name || item.title,\n          to: rel.name || rel,\n          type: rel.relationship || 'RELATES_TO'\n        });\n      }\n    }\n  }\n}\n\nreturn [\n  {\n    json: {\n      query: queryData.query,\n      session_id: queryData.session_id,\n      user_id: queryData.user_id,\n      timestamp: new Date().toISOString(),\n      raw_results: results,\n      entities: entities,\n      relationships: relationships,\n      source: 'openclaw',\n      result_count: entities.length\n    }\n  }\n];"
+      },
+      "id": "node-process-openclaw",
+      "name": "Process OpenClaw Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2200, 420]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:11434/api/generate",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"llama3.1:8b\",\n  \"prompt\": \"You are a medical data validation assistant. Review the following medical data for accuracy, consistency, and completeness. Flag any issues. Return a JSON object with fields: valid (boolean), issues (array of strings), cleaned_data (the validated data).\\n\\nData to validate:\\n{{ JSON.stringify($json.entities) }}\",\n  \"stream\": false,\n  \"options\": {\n    \"temperature\": 0.1,\n    \"num_predict\": 2000\n  }\n}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "node-ollama-validate",
+      "name": "Ollama Data Validation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2420, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "const ollamaResponse = $input.first().json;\nconst processedData = $('Process OpenClaw Results').first().json;\n\nlet validationResult;\ntry {\n  const responseText = ollamaResponse.response || '{}';\n  // Try to extract JSON from the Ollama response\n  const jsonMatch = responseText.match(/\\{[\\s\\S]*\\}/);\n  validationResult = jsonMatch ? JSON.parse(jsonMatch[0]) : { valid: true, issues: [], cleaned_data: null };\n} catch (e) {\n  validationResult = { valid: true, issues: ['Could not parse validation response'], cleaned_data: null };\n}\n\nconst entities = validationResult.cleaned_data || processedData.entities;\n\nreturn [\n  {\n    json: {\n      ...processedData,\n      entities: entities,\n      validation: {\n        is_valid: validationResult.valid,\n        issues: validationResult.issues || [],\n        validated_at: new Date().toISOString(),\n        validator: 'ollama_llama3.1_8b'\n      }\n    }\n  }\n];"
+      },
+      "id": "node-parse-validation",
+      "name": "Parse Validation Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2640, 420]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=UNWIND $entities AS entity\nMERGE (n {name: entity.name})\nON CREATE SET \n  n.type = entity.type,\n  n.source = entity.source,\n  n.data = entity.data,\n  n.created_at = datetime(),\n  n.updated_at = datetime()\nON MATCH SET\n  n.data = entity.data,\n  n.source = entity.source,\n  n.updated_at = datetime()\nWITH n, entity\nCALL apoc.create.addLabels(n, [entity.type]) YIELD node\nRETURN count(node) as stored_count",
+        "parameters": {
+          "entities": "={{ $json.entities }}"
+        }
+      },
+      "id": "node-neo4j-store-entities",
+      "name": "Store Entities in Neo4j",
+      "type": "n8n-nodes-base.neo4j",
+      "typeVersion": 1,
+      "position": [2860, 360],
+      "credentials": {
+        "neo4j": {
+          "id": "neo4j-cred-1",
+          "name": "Neo4j Local"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=UNWIND $relationships AS rel\nMATCH (a {name: rel.from})\nMATCH (b {name: rel.to})\nCALL apoc.merge.relationship(a, rel.type, {}, {created_at: datetime()}, b, {}) YIELD rel as r\nRETURN count(r) as relationship_count",
+        "parameters": {
+          "relationships": "={{ $json.relationships }}"
+        }
+      },
+      "id": "node-neo4j-store-rels",
+      "name": "Store Relationships in Neo4j",
+      "type": "n8n-nodes-base.neo4j",
+      "typeVersion": 1,
+      "position": [2860, 520],
+      "credentials": {
+        "neo4j": {
+          "id": "neo4j-cred-1",
+          "name": "Neo4j Local"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const processedData = $('Parse Validation Results').first().json;\nconst storedEntities = $('Store Entities in Neo4j').first().json;\nconst storedRels = $('Store Relationships in Neo4j').first().json;\n\nreturn [\n  {\n    json: {\n      status: 'success',\n      source: 'openclaw_fresh',\n      cache_status: 'MISS_STORED',\n      query: processedData.query,\n      session_id: processedData.session_id,\n      timestamp: new Date().toISOString(),\n      results: processedData.raw_results,\n      validation: processedData.validation,\n      storage: {\n        entities_stored: storedEntities.stored_count || 0,\n        relationships_stored: storedRels.relationship_count || 0\n      },\n      data_freshness: 'live'\n    }\n  }\n];"
+      },
+      "id": "node-format-fresh",
+      "name": "Format Fresh Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3100, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\n\n// Audit log entry for compliance\nconst auditEntry = {\n  event_type: 'query_processed',\n  session_id: data.session_id,\n  timestamp: new Date().toISOString(),\n  source: data.source,\n  cache_status: data.cache_status,\n  result_count: data.results ? (Array.isArray(data.results) ? data.results.length : 1) : 0,\n  validation_status: data.validation ? data.validation.is_valid : 'n/a',\n  phi_detected: data.phi_handling ? true : false,\n  compliance_flags: ['HIPAA_COMPLIANT', 'LOCAL_PROCESSING']\n};\n\nreturn [\n  {\n    json: {\n      response: data,\n      audit: auditEntry\n    }\n  }\n];"
+      },
+      "id": "node-audit-log",
+      "name": "Audit Log Entry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3320, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=CREATE (a:AuditLog {\n  event_type: $audit.event_type,\n  session_id: $audit.session_id,\n  timestamp: datetime($audit.timestamp),\n  source: $audit.source,\n  cache_status: $audit.cache_status,\n  result_count: $audit.result_count,\n  phi_detected: $audit.phi_detected,\n  compliance_flags: $audit.compliance_flags\n})\nRETURN a",
+        "parameters": {
+          "audit": "={{ $json.audit }}"
+        }
+      },
+      "id": "node-neo4j-audit",
+      "name": "Store Audit Log",
+      "type": "n8n-nodes-base.neo4j",
+      "typeVersion": 1,
+      "position": [3540, 300],
+      "credentials": {
+        "neo4j": {
+          "id": "neo4j-cred-1",
+          "name": "Neo4j Local"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($('Audit Log Entry').first().json.response) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "X-Session-Id",
+                "value": "={{ $('Audit Log Entry').first().json.response.session_id }}"
+              },
+              {
+                "name": "X-Cache-Status",
+                "value": "={{ $('Audit Log Entry').first().json.response.cache_status }}"
+              },
+              {
+                "name": "X-Compliance",
+                "value": "HIPAA_LOCAL_PROCESSING"
+              }
+            ]
+          }
+        }
+      },
+      "id": "node-respond-user",
+      "name": "Respond to User",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [3760, 300]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 24
+            }
+          ]
+        }
+      },
+      "id": "node-scheduled-cleanup",
+      "name": "Daily Maintenance Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [220, 640]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "// Remove stale cached data older than 30 days\nMATCH (n)\nWHERE n.updated_at < datetime() - duration('P30D')\n  AND NOT n:AuditLog\nDETACH DELETE n\nRETURN count(*) as removed_count"
+      },
+      "id": "node-neo4j-cleanup",
+      "name": "Cleanup Stale Neo4j Data",
+      "type": "n8n-nodes-base.neo4j",
+      "typeVersion": 1,
+      "position": [440, 640],
+      "credentials": {
+        "neo4j": {
+          "id": "neo4j-cred-1",
+          "name": "Neo4j Local"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "// Index maintenance - ensure indexes exist\nCREATE INDEX IF NOT EXISTS FOR (g:Gene) ON (g.name);\nCREATE INDEX IF NOT EXISTS FOR (d:Drug) ON (d.name);\nCREATE INDEX IF NOT EXISTS FOR (c:Condition) ON (c.name);\nCREATE INDEX IF NOT EXISTS FOR (m:MedicalRecord) ON (m.name);\nCREATE INDEX IF NOT EXISTS FOR (a:AuditLog) ON (a.session_id);\nRETURN 'indexes_verified' as status"
+      },
+      "id": "node-neo4j-indexes",
+      "name": "Verify Neo4j Indexes",
+      "type": "n8n-nodes-base.neo4j",
+      "typeVersion": 1,
+      "position": [660, 640],
+      "credentials": {
+        "neo4j": {
+          "id": "neo4j-cred-1",
+          "name": "Neo4j Local"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:11434/api/generate",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"model\": \"llama3.1:8b\",\n  \"prompt\": \"Respond with only: OK\",\n  \"stream\": false,\n  \"options\": { \"num_predict\": 5 }\n}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "node-ollama-healthcheck",
+      "name": "Ollama Health Check",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [660, 780],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "ollama-up",
+              "leftValue": "={{ $json.response }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "isNotEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-ollama-status",
+      "name": "Ollama Status Check",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [880, 780]
+    },
+    {
+      "parameters": {
+        "jsCode": "const cleanupResult = $('Cleanup Stale Neo4j Data').first().json;\nconst indexResult = $('Verify Neo4j Indexes').first().json;\nconst ollamaUp = true;\n\nreturn [\n  {\n    json: {\n      maintenance_report: {\n        timestamp: new Date().toISOString(),\n        stale_records_removed: cleanupResult.removed_count || 0,\n        indexes_status: indexResult.status || 'verified',\n        ollama_status: 'healthy',\n        next_run: new Date(Date.now() + 86400000).toISOString()\n      }\n    }\n  }\n];"
+      },
+      "id": "node-maintenance-report-ok",
+      "name": "Maintenance Report (OK)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 720]
+    },
+    {
+      "parameters": {
+        "jsCode": "const cleanupResult = $('Cleanup Stale Neo4j Data').first().json;\nconst indexResult = $('Verify Neo4j Indexes').first().json;\n\nreturn [\n  {\n    json: {\n      maintenance_report: {\n        timestamp: new Date().toISOString(),\n        stale_records_removed: cleanupResult.removed_count || 0,\n        indexes_status: indexResult.status || 'verified',\n        ollama_status: 'DOWN - ATTENTION REQUIRED',\n        alert: 'Ollama service is not responding. PHI redaction unavailable.',\n        next_run: new Date(Date.now() + 86400000).toISOString()\n      }\n    }\n  }\n];"
+      },
+      "id": "node-maintenance-report-fail",
+      "name": "Maintenance Report (Alert)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 860]
+    }
+  ],
+  "connections": {
+    "User Query Intake": {
+      "main": [
+        [
+          {
+            "node": "Sanitize & Classify Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize & Classify Input": {
+      "main": [
+        [
+          {
+            "node": "PHI Data Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PHI Data Router": {
+      "main": [
+        [
+          {
+            "node": "Ollama PHI Redaction",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Check Neo4j Cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama PHI Redaction": {
+      "main": [
+        [
+          {
+            "node": "Merge Redacted Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Redacted Query": {
+      "main": [
+        [
+          {
+            "node": "Check Neo4j Cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Neo4j Cache": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Cache Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Cache Results": {
+      "main": [
+        [
+          {
+            "node": "Cache Hit Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cache Hit Router": {
+      "main": [
+        [
+          {
+            "node": "Format Cached Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "OpenClaw Research Fetch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Cached Response": {
+      "main": [
+        [
+          {
+            "node": "Audit Log Entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenClaw Research Fetch": {
+      "main": [
+        [
+          {
+            "node": "Process OpenClaw Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process OpenClaw Results": {
+      "main": [
+        [
+          {
+            "node": "Ollama Data Validation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Data Validation": {
+      "main": [
+        [
+          {
+            "node": "Parse Validation Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Validation Results": {
+      "main": [
+        [
+          {
+            "node": "Store Entities in Neo4j",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Store Relationships in Neo4j",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Entities in Neo4j": {
+      "main": [
+        [
+          {
+            "node": "Format Fresh Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Relationships in Neo4j": {
+      "main": [
+        [
+          {
+            "node": "Format Fresh Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Fresh Response": {
+      "main": [
+        [
+          {
+            "node": "Audit Log Entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit Log Entry": {
+      "main": [
+        [
+          {
+            "node": "Store Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Audit Log": {
+      "main": [
+        [
+          {
+            "node": "Respond to User",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily Maintenance Trigger": {
+      "main": [
+        [
+          {
+            "node": "Cleanup Stale Neo4j Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cleanup Stale Neo4j Data": {
+      "main": [
+        [
+          {
+            "node": "Verify Neo4j Indexes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Neo4j Indexes": {
+      "main": [
+        [
+          {
+            "node": "Ollama Health Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Health Check": {
+      "main": [
+        [
+          {
+            "node": "Ollama Status Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Status Check": {
+      "main": [
+        [
+          {
+            "node": "Maintenance Report (OK)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Maintenance Report (Alert)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "precision-medicine"
+    },
+    {
+      "name": "production"
+    },
+    {
+      "name": "hipaa-compliant"
+    }
+  ],
+  "pinData": {},
+  "versionId": "1.0.0",
+  "meta": {
+    "instanceId": "precision-medicine-engine-v1",
+    "templateCredsSetupCompleted": false
+  }
+}

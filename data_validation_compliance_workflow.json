@@ -1,0 +1,274 @@
+{
+  "name": "Precision Medicine - Data Validation & Compliance",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "validate-medical-data",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "val-webhook",
+      "name": "Validation Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [220, 300],
+      "webhookId": "validate-medical-data"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body;\nconst records = body.records || [body.record] || [];\nconst validationType = body.validation_type || 'full';\nconst sessionId = body.session_id || $execution.id;\n\nif (!records.length || (records.length === 1 && !records[0])) {\n  throw new Error('No records provided for validation.');\n}\n\n// Schema validation rules for medical data\nconst schemaRules = {\n  Gene: {\n    required: ['name'],\n    optional: ['symbol', 'chromosome', 'description', 'source', 'ncbi_id'],\n    namePattern: /^[A-Za-z0-9\\-\\.]+$/\n  },\n  Drug: {\n    required: ['name'],\n    optional: ['generic_name', 'brand_name', 'mechanism', 'indications', 'drugbank_id', 'source'],\n    namePattern: /^[A-Za-z0-9\\-\\s\\.\\(\\)]+$/\n  },\n  Condition: {\n    required: ['name'],\n    optional: ['icd10_code', 'description', 'category', 'omim_id', 'source'],\n    namePattern: /^[A-Za-z0-9\\-\\s\\.\\,\\'\\(\\)]+$/\n  },\n  MedicalRecord: {\n    required: ['name'],\n    optional: ['description', 'source', 'data', 'type'],\n    namePattern: /^.+$/\n  }\n};\n\nconst validationResults = records.map((record, index) => {\n  const errors = [];\n  const warnings = [];\n  const recordType = record.type || 'MedicalRecord';\n  const rules = schemaRules[recordType] || schemaRules.MedicalRecord;\n\n  // Check required fields\n  for (const field of rules.required) {\n    if (!record[field] || (typeof record[field] === 'string' && !record[field].trim())) {\n      errors.push(`Missing required field: ${field}`);\n    }\n  }\n\n  // Validate name pattern\n  if (record.name && rules.namePattern && !rules.namePattern.test(record.name)) {\n    warnings.push(`Name contains unexpected characters: ${record.name}`);\n  }\n\n  // Check for data integrity\n  if (record.data) {\n    try {\n      if (typeof record.data === 'string') JSON.parse(record.data);\n    } catch (e) {\n      errors.push('Data field contains invalid JSON');\n    }\n  }\n\n  // Check for duplicate entries\n  const duplicates = records.filter((r, i) => i !== index && r.name === record.name && r.type === record.type);\n  if (duplicates.length > 0) {\n    warnings.push(`Duplicate entry found for: ${record.name}`);\n  }\n\n  // Check source attribution\n  if (!record.source) {\n    warnings.push('No source attribution provided');\n  }\n\n  return {\n    index: index,\n    record_name: record.name || 'UNNAMED',\n    record_type: recordType,\n    is_valid: errors.length === 0,\n    errors: errors,\n    warnings: warnings,\n    original_record: record\n  };\n});\n\nconst overallValid = validationResults.every(r => r.is_valid);\n\nreturn [\n  {\n    json: {\n      session_id: sessionId,\n      validation_type: validationType,\n      overall_valid: overallValid,\n      total_records: records.length,\n      valid_count: validationResults.filter(r => r.is_valid).length,\n      invalid_count: validationResults.filter(r => !r.is_valid).length,\n      warning_count: validationResults.reduce((sum, r) => sum + r.warnings.length, 0),\n      results: validationResults,\n      timestamp: new Date().toISOString()\n    }\n  }\n];"
+      },
+      "id": "val-schema-check",
+      "name": "Schema Validation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "needs-deep-validation",
+              "leftValue": "={{ $json.validation_type }}",
+              "rightValue": "full",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "val-depth-router",
+      "name": "Full Validation?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [660, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:11434/api/generate",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"llama3.1:8b\",\n  \"prompt\": \"You are a medical data quality expert. Review the following medical records for scientific accuracy, consistency, and completeness. For each record, assess:\\n1. Is the medical terminology correct?\\n2. Are the relationships between entities plausible?\\n3. Is the data internally consistent?\\n4. Are there any red flags or anomalies?\\n\\nReturn a JSON object with: { records: [{ name, accuracy_score (0-100), issues: [], suggestions: [] }], overall_quality_score: number }\\n\\nRecords to validate:\\n{{ JSON.stringify($json.results.filter(r => r.is_valid).map(r => r.original_record)) }}\",\n  \"stream\": false,\n  \"options\": {\n    \"temperature\": 0.1,\n    \"num_predict\": 3000\n  }\n}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "val-ollama-deep",
+      "name": "Ollama Deep Validation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const ollamaResponse = $input.first().json;\nconst schemaResults = $('Schema Validation').first().json;\n\nlet deepValidation;\ntry {\n  const responseText = ollamaResponse.response || '{}';\n  const jsonMatch = responseText.match(/\\{[\\s\\S]*\\}/);\n  deepValidation = jsonMatch ? JSON.parse(jsonMatch[0]) : { records: [], overall_quality_score: 0 };\n} catch (e) {\n  deepValidation = {\n    records: [],\n    overall_quality_score: null,\n    parse_error: 'Could not parse Ollama deep validation response'\n  };\n}\n\n// Merge deep validation with schema validation\nconst mergedResults = schemaResults.results.map(schemaResult => {\n  const deepResult = (deepValidation.records || []).find(\n    r => r.name === schemaResult.record_name\n  );\n\n  return {\n    ...schemaResult,\n    deep_validation: deepResult || null,\n    accuracy_score: deepResult ? deepResult.accuracy_score : null,\n    additional_issues: deepResult ? deepResult.issues : [],\n    suggestions: deepResult ? deepResult.suggestions : []\n  };\n});\n\nreturn [\n  {\n    json: {\n      ...schemaResults,\n      results: mergedResults,\n      deep_validation_performed: true,\n      overall_quality_score: deepValidation.overall_quality_score,\n      validator: 'ollama_llama3.1_8b'\n    }\n  }\n];"
+      },
+      "id": "val-merge-deep",
+      "name": "Merge Deep Validation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "const schemaResults = $input.first().json;\n\nreturn [\n  {\n    json: {\n      ...schemaResults,\n      deep_validation_performed: false,\n      overall_quality_score: null,\n      validator: 'schema_only'\n    }\n  }\n];"
+      },
+      "id": "val-skip-deep",
+      "name": "Schema Only Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "const validationData = $input.first().json;\n\n// HIPAA compliance checks\nconst complianceChecks = {\n  data_minimization: true,\n  purpose_limitation: true,\n  storage_limitation: true,\n  integrity_confidentiality: true,\n  accountability: true\n};\n\n// Check for PHI in validation results (should not be present in output)\nconst resultStr = JSON.stringify(validationData.results);\nconst phiPatterns = [\n  { pattern: /\\b\\d{3}-\\d{2}-\\d{4}\\b/, type: 'SSN' },\n  { pattern: /\\b[A-Za-z]+@[A-Za-z]+\\.[A-Za-z]+\\b/, type: 'EMAIL' },\n  { pattern: /\\b\\d{3}[\\s.-]\\d{3}[\\s.-]\\d{4}\\b/, type: 'PHONE' }\n];\n\nconst phiLeaks = [];\nfor (const { pattern, type } of phiPatterns) {\n  if (pattern.test(resultStr)) {\n    phiLeaks.push(type);\n    complianceChecks.integrity_confidentiality = false;\n  }\n}\n\nconst isCompliant = Object.values(complianceChecks).every(v => v);\n\nreturn [\n  {\n    json: {\n      validation_report: {\n        session_id: validationData.session_id,\n        timestamp: new Date().toISOString(),\n        overall_valid: validationData.overall_valid,\n        total_records: validationData.total_records,\n        valid_count: validationData.valid_count,\n        invalid_count: validationData.invalid_count,\n        warning_count: validationData.warning_count,\n        quality_score: validationData.overall_quality_score,\n        deep_validated: validationData.deep_validation_performed,\n        results: validationData.results\n      },\n      compliance: {\n        hipaa_compliant: isCompliant,\n        checks: complianceChecks,\n        phi_leaks_detected: phiLeaks,\n        processing_location: 'LOCAL_ONLY',\n        assessed_at: new Date().toISOString()\n      }\n    }\n  }\n];"
+      },
+      "id": "val-compliance",
+      "name": "Compliance Assessment",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=CREATE (v:ValidationReport {\n  session_id: $report.session_id,\n  timestamp: datetime($report.timestamp),\n  overall_valid: $report.overall_valid,\n  total_records: $report.total_records,\n  valid_count: $report.valid_count,\n  invalid_count: $report.invalid_count,\n  quality_score: coalesce($report.quality_score, -1),\n  hipaa_compliant: $compliance.hipaa_compliant,\n  processing_location: $compliance.processing_location\n})\nRETURN v",
+        "parameters": {
+          "report": "={{ $json.validation_report }}",
+          "compliance": "={{ $json.compliance }}"
+        }
+      },
+      "id": "val-store-report",
+      "name": "Store Validation Report",
+      "type": "n8n-nodes-base.neo4j",
+      "typeVersion": 1,
+      "position": [1540, 300],
+      "credentials": {
+        "neo4j": {
+          "id": "neo4j-cred-1",
+          "name": "Neo4j Local"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($('Compliance Assessment').first().json) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "X-Validation-Status",
+                "value": "={{ $('Compliance Assessment').first().json.validation_report.overall_valid ? 'PASSED' : 'FAILED' }}"
+              },
+              {
+                "name": "X-Compliance",
+                "value": "={{ $('Compliance Assessment').first().json.compliance.hipaa_compliant ? 'HIPAA_COMPLIANT' : 'NON_COMPLIANT' }}"
+              }
+            ]
+          }
+        }
+      },
+      "id": "val-respond",
+      "name": "Validation Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1760, 300]
+    }
+  ],
+  "connections": {
+    "Validation Webhook": {
+      "main": [
+        [
+          {
+            "node": "Schema Validation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schema Validation": {
+      "main": [
+        [
+          {
+            "node": "Full Validation?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Full Validation?": {
+      "main": [
+        [
+          {
+            "node": "Ollama Deep Validation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Schema Only Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Deep Validation": {
+      "main": [
+        [
+          {
+            "node": "Merge Deep Validation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Deep Validation": {
+      "main": [
+        [
+          {
+            "node": "Compliance Assessment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schema Only Result": {
+      "main": [
+        [
+          {
+            "node": "Compliance Assessment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compliance Assessment": {
+      "main": [
+        [
+          {
+            "node": "Store Validation Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Validation Report": {
+      "main": [
+        [
+          {
+            "node": "Validation Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "precision-medicine"
+    },
+    {
+      "name": "data-validation"
+    },
+    {
+      "name": "compliance"
+    },
+    {
+      "name": "hipaa-compliant"
+    }
+  ],
+  "pinData": {},
+  "versionId": "1.0.0",
+  "meta": {
+    "instanceId": "precision-medicine-validation-v1",
+    "templateCredsSetupCompleted": false
+  }
+}
