@@ -4,6 +4,8 @@ Precision Medicine Automation system built with n8n workflows, Neo4j graph datab
 
 ## Architecture
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed workflow coordination diagrams, security model, Neo4j graph schema, and scalability strategy.
+
 ```
 User Query → n8n Webhook
                 ↓
@@ -14,7 +16,11 @@ User Query → n8n Webhook
         ↓                ↓
   Ollama Redaction   ────┘
         ↓
-  Neo4j Cache Check
+  DeepSeek Coder v2 → Generates Cypher
+        ↓
+  Validate & Sanitize Cypher
+        ↓
+  Execute Dynamic Cypher on Neo4j
         ↓
   ┌─────┴──────┐
  HIT         MISS
@@ -39,7 +45,9 @@ Data      Ollama Validation
 ### 1. Main Orchestrator (`precision_medicine_main_workflow.json`)
 - Webhook intake for user queries
 - Input sanitization and PHI detection
-- Neo4j cache-first lookup
+- DeepSeek Coder v2 generates context-aware Cypher queries from natural language
+- Cypher sanitization layer (write ops blocked, LIMIT enforced, safe fallback)
+- Neo4j cache-first lookup via dynamic Cypher
 - OpenClaw external research (cache miss)
 - Ollama-based data validation
 - Neo4j entity and relationship storage
@@ -63,14 +71,14 @@ Data      Ollama Validation
 
 - **n8n** (self-hosted)
 - **Neo4j** with APOC plugin
-- **Ollama** with `llama3.1:8b` model pulled
+- **Ollama** with `llama3.1:8b` and `deepseek-coder-v2` models pulled
 - **OpenClaw** API access
 
 ## Setup
 
 1. Copy `.env.example` to `.env` and configure your credentials
 2. Start Neo4j, Ollama, and n8n
-3. Pull the Ollama model: `ollama pull llama3.1:8b`
+3. Pull the Ollama models: `ollama pull llama3.1:8b && ollama pull deepseek-coder-v2`
 4. Import the three workflow JSON files into n8n
 5. Configure the Neo4j credential in n8n (id: `neo4j-cred-1`)
 6. Activate the workflows
