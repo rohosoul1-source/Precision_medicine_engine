@@ -1,5 +1,6 @@
 {
   "name": "Precision Medicine - Data Validation & Compliance",
+  "notes": "DATA VALIDATION & COMPLIANCE (v1.0.0)\n======================================\n\nPurpose: Validates medical data records against schema rules and optionally\nuses Ollama for deep medical accuracy validation. Assesses HIPAA compliance.\n\nEndpoint: POST /webhook/validate-medical-data\nExpected body: {\n  records: Array<{ type, name, ... }>,\n  validation_type: 'full'|'schema',\n  session_id?: string\n}\n\nValidation Modes:\n- 'schema': Fast structural validation only (required fields, name patterns,\n  JSON integrity, duplicates, source attribution)\n- 'full': Schema validation + Ollama deep validation (medical terminology\n  accuracy, relationship plausibility, internal consistency, anomaly detection)\n\nSupported Record Types:\n- Gene: required [name], optional [symbol, chromosome, description, source, ncbi_id]\n- Drug: required [name], optional [generic_name, brand_name, mechanism, indications, drugbank_id, source]\n- Condition: required [name], optional [icd10_code, description, category, omim_id, source]\n- MedicalRecord: required [name], optional [description, source, data, type]\n\nCompliance Assessment:\n- Checks 5 HIPAA principles: data_minimization, purpose_limitation,\n  storage_limitation, integrity_confidentiality, accountability\n- Scans validation output for PHI leaks (SSN, email, phone patterns)\n- Flags non-compliance if PHI is detected in output\n\nDependencies:\n- Ollama (http://localhost:11434) with llama3.1:8b (for 'full' mode only)\n- Neo4j (bolt://localhost:7687) for validation report storage\n\nSee ARCHITECTURE.md for inter-workflow coordination details.",
   "nodes": [
     {
       "parameters": {
@@ -13,7 +14,9 @@
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
       "position": [220, 300],
-      "webhookId": "validate-medical-data"
+      "webhookId": "validate-medical-data",
+      "notes": "ENTRY POINT: Receives medical data validation requests via POST.\nExpected body: { records: array, validation_type?: 'full'|'schema', session_id?: string }\nAccepts either 'records' (array) or 'record' (single object).\nResponse is deferred to the 'Validation Response' node at the end.",
+      "notesInFlow": true
     },
     {
       "parameters": {
@@ -23,7 +26,9 @@
       "name": "Schema Validation",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [440, 300]
+      "position": [440, 300],
+      "notes": "VALIDATION: Runs structural schema checks on each record.\nChecks performed per record:\n1. Required fields present and non-empty (by record type)\n2. Name matches expected pattern (regex per type)\n3. Data field is valid JSON (if present)\n4. Duplicate detection across the batch\n5. Source attribution warning (if missing)\n\nRecord types with custom rules: Gene, Drug, Condition, MedicalRecord.\nUnknown types default to MedicalRecord rules.\n\nOutputs: per-record results with errors[], warnings[], is_valid flag.\nOverall summary: total_records, valid_count, invalid_count, warning_count.",
+      "notesInFlow": true
     },
     {
       "parameters": {
@@ -52,7 +57,9 @@
       "name": "Full Validation?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [660, 300]
+      "position": [660, 300],
+      "notes": "BRANCH: Routes based on validation_type parameter.\n- TRUE (output 0): validation_type == 'full' -> Ollama Deep Validation\n- FALSE (output 1): any other value -> Schema Only Result (faster, no LLM)\n\nUse 'schema' for quick structural checks.\nUse 'full' when medical accuracy verification is needed (slower, uses Ollama).",
+      "notesInFlow": true
     },
     {
       "parameters": {
@@ -69,7 +76,9 @@
       "name": "Ollama Deep Validation",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [880, 200]
+      "position": [880, 200],
+      "notes": "LOCAL LLM: Calls Ollama llama3.1:8b for deep medical data review.\nModel: llama3.1:8b | Temperature: 0.1 | Timeout: 120s\n\nOnly sends records that passed schema validation (filters out invalid ones).\nAssesses each record for:\n1. Medical terminology correctness\n2. Relationship plausibility between entities\n3. Internal data consistency\n4. Red flags or anomalies\n\nReturns: { records: [{ name, accuracy_score (0-100), issues, suggestions }],\n           overall_quality_score: number }",
+      "notesInFlow": true
     },
     {
       "parameters": {
@@ -79,7 +88,9 @@
       "name": "Merge Deep Validation",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1100, 200]
+      "position": [1100, 200],
+      "notes": "TRANSFORM: Merges Ollama deep validation results with schema validation.\nMatches deep results to schema results by record name.\nAdds: deep_validation object, accuracy_score, additional_issues, suggestions.\nSets deep_validation_performed=true and overall_quality_score.\nGracefully handles JSON parse failures from Ollama response.",
+      "notesInFlow": false
     },
     {
       "parameters": {
@@ -89,7 +100,9 @@
       "name": "Schema Only Result",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1100, 400]
+      "position": [1100, 400],
+      "notes": "PASSTHROUGH: Passes schema results directly without deep validation.\nSets deep_validation_performed=false, quality_score=null, validator='schema_only'.\nThis is the fast path when validation_type != 'full'.",
+      "notesInFlow": false
     },
     {
       "parameters": {
@@ -99,7 +112,9 @@
       "name": "Compliance Assessment",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1320, 300]
+      "position": [1320, 300],
+      "notes": "COMPLIANCE: Runs HIPAA compliance assessment on the validation output.\nChecks 5 HIPAA principles: data_minimization, purpose_limitation,\nstorage_limitation, integrity_confidentiality, accountability.\n\nPHI LEAK DETECTION: Scans the serialized validation results for:\n- SSN patterns (###-##-####)\n- Email addresses\n- Phone numbers (###-###-#### or ###.###.####)\nIf PHI is detected in output, integrity_confidentiality is flagged false.\n\nBoth full and schema-only paths converge here.\nOutputs: validation_report + compliance assessment with hipaa_compliant flag.",
+      "notesInFlow": true
     },
     {
       "parameters": {
@@ -120,7 +135,9 @@
           "id": "neo4j-cred-1",
           "name": "Neo4j Local"
         }
-      }
+      },
+      "notes": "DATABASE WRITE: Persists the validation report as a :ValidationReport node.\nStores: session_id, timestamp, overall_valid, total/valid/invalid counts,\nquality_score (from deep validation or -1), hipaa_compliant, processing_location.\n\nValidation reports can be queried to track data quality trends over time.",
+      "notesInFlow": false
     },
     {
       "parameters": {
@@ -145,7 +162,9 @@
       "name": "Validation Response",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [1760, 300]
+      "position": [1760, 300],
+      "notes": "EXIT POINT: Returns the full validation and compliance report.\nCustom response headers:\n- X-Validation-Status: PASSED or FAILED (based on overall_valid)\n- X-Compliance: HIPAA_COMPLIANT or NON_COMPLIANT\n\nResponse body includes both the validation_report and compliance objects.",
+      "notesInFlow": true
     }
   ],
   "connections": {

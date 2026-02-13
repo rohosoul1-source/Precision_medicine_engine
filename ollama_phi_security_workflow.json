@@ -1,5 +1,6 @@
 {
   "name": "Precision Medicine - Ollama PHI Security Processor",
+  "notes": "PHI SECURITY PROCESSOR (v1.0.0)\n================================\n\nPurpose: Dedicated sub-workflow for Protected Health Information (PHI) operations.\nAll processing runs entirely on Ollama (localhost) -- zero network egress.\n\nEndpoint: POST /webhook/phi-security-process\nExpected body: { data: string, operation: 'redact'|'classify', session_id?: string }\n\nSupported Operations:\n- 'redact': Strips all 18 HIPAA identifier types, replaces with [PLACEHOLDER] tags\n- 'classify': Assesses sensitivity level (low/medium/high/critical) and identifies PHI types\n\nSecurity Guarantees:\n- Processing location: LOCAL_ONLY (Ollama llama3.1:8b on localhost:11434)\n- Network egress: false (no data leaves the machine)\n- Full audit trail: every operation logged as :PHIAuditLog node in Neo4j\n\nCan be called by:\n- Main Orchestrator workflow (for inline PHI redaction)\n- External systems via webhook\n- Manually for batch PHI processing\n\nDependencies:\n- Ollama (http://localhost:11434) with llama3.1:8b\n- Neo4j (bolt://localhost:7687) for audit storage\n\nSee ARCHITECTURE.md for inter-workflow coordination details.",
   "nodes": [
     {
       "parameters": {
@@ -13,7 +14,9 @@
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
       "position": [220, 300],
-      "webhookId": "phi-security-process"
+      "webhookId": "phi-security-process",
+      "notes": "ENTRY POINT: Receives PHI processing requests via POST.\nExpected body: { data: string|object, operation: string, session_id?: string }\nValid operations: redact, deidentify, reidentify, classify, validate\nResponse is deferred to the 'PHI Response' node at the end.",
+      "notesInFlow": true
     },
     {
       "parameters": {
@@ -23,7 +26,9 @@
       "name": "Classify PHI Input",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [440, 300]
+      "position": [440, 300],
+      "notes": "SECURITY GATE: Validates operation type and builds security context.\nAllowed operations: redact, deidentify, reidentify, classify, validate.\nRejects invalid operations with an error.\n\nCreates a security context object that travels through the entire pipeline:\n- processing_location: LOCAL_ONLY\n- network_egress: false\n- model: llama3.1:8b\n\nConverts non-string data to JSON string for uniform handling.",
+      "notesInFlow": true
     },
     {
       "parameters": {
@@ -52,7 +57,9 @@
       "name": "Is Redact?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [660, 300]
+      "position": [660, 300],
+      "notes": "BRANCH: Routes based on the requested operation.\n- TRUE (output 0): operation == 'redact' -> Ollama Redact PHI\n- FALSE (output 1): any other operation -> Ollama Classify Sensitivity\n\nTo add more operations, chain additional IF nodes after the FALSE output.",
+      "notesInFlow": true
     },
     {
       "parameters": {
@@ -69,7 +76,9 @@
       "name": "Ollama Redact PHI",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [880, 200]
+      "position": [880, 200],
+      "notes": "LOCAL LLM: Calls Ollama llama3.1:8b for comprehensive PHI redaction.\nModel: llama3.1:8b | Temperature: 0.0 (fully deterministic) | top_k: 1 | Timeout: 90s\n\nCovers all 18 HIPAA Safe Harbor identifier types:\n- Patient names -> [PATIENT_NAME]\n- Dates (except year) -> [DATE]\n- Phone/fax -> [PHONE]\n- Email -> [EMAIL]\n- SSN -> [SSN]\n- MRN -> [MRN]\n- Health plan IDs -> [HEALTH_PLAN_ID]\n- Account numbers -> [ACCOUNT]\n- License/cert numbers -> [LICENSE]\n- Vehicle/device IDs -> [DEVICE_ID]\n- URLs -> [URL]\n- IP addresses -> [IP]\n- Biometric IDs -> [BIOMETRIC]\n- Photo refs -> [PHOTO_REF]\n- Unique IDs -> [UNIQUE_ID]\n- Sub-state geography -> [LOCATION]\n- Ages 90+ -> [AGE_90PLUS]\n\nIMPORTANT: Runs on localhost:11434 only. No data egress.",
+      "notesInFlow": true
     },
     {
       "parameters": {
@@ -86,7 +95,9 @@
       "name": "Ollama Classify Sensitivity",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [880, 400]
+      "position": [880, 400],
+      "notes": "LOCAL LLM: Calls Ollama llama3.1:8b to classify data sensitivity.\nModel: llama3.1:8b | Temperature: 0.1 | Timeout: 60s\n\nReturns JSON: {\n  sensitivity_level: 'low'|'medium'|'high'|'critical',\n  phi_types_found: string[],\n  contains_phi: boolean,\n  recommendation: string\n}\n\nUseful for determining handling requirements before processing data.",
+      "notesInFlow": false
     },
     {
       "parameters": {
@@ -96,7 +107,9 @@
       "name": "Format Redaction Result",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1100, 200]
+      "position": [1100, 200],
+      "notes": "TRANSFORM: Parses Ollama redaction output and generates a summary.\nCounts all [PLACEHOLDER] tags in the redacted text using regex.\nProduces: total_redactions, phi_types_redacted (unique set),\nredaction_counts (breakdown by type, e.g. {PATIENT_NAME: 2, SSN: 1}).",
+      "notesInFlow": false
     },
     {
       "parameters": {
@@ -106,7 +119,9 @@
       "name": "Format Classification Result",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1100, 400]
+      "position": [1100, 400],
+      "notes": "TRANSFORM: Parses Ollama classification JSON response.\nExtracts JSON from LLM text using regex matching.\nOn parse failure, defaults to sensitivity_level='high' and contains_phi=true\n(fail-safe: treat unclassifiable data as sensitive).",
+      "notesInFlow": false
     },
     {
       "parameters": {
@@ -116,7 +131,9 @@
       "name": "PHI Audit Trail",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1320, 300]
+      "position": [1320, 300],
+      "notes": "COMPLIANCE: Generates a unique audit record for every PHI operation.\nAudit ID format: PHI-{timestamp}-{random9chars}\n\nCaptures: operation type, timestamp, processing_location (LOCAL_ONLY),\nmodel_used, data_egress (always false), session_id, status.\n\nBoth redact and classify paths converge here.\nCompliance object confirms: hipaa_compliant, local_only, no_cloud_processing.",
+      "notesInFlow": true
     },
     {
       "parameters": {
@@ -136,7 +153,9 @@
           "id": "neo4j-cred-1",
           "name": "Neo4j Local"
         }
-      }
+      },
+      "notes": "DATABASE WRITE: Persists the PHI audit record as a :PHIAuditLog node.\nStores: audit_id, operation, timestamp, processing_location, model_used,\ndata_egress, session_id, status, hipaa_compliant.\n\nThese records are separate from :AuditLog (main workflow) for easy querying.\nPHI audit logs are never auto-purged by the maintenance cleanup.",
+      "notesInFlow": false
     },
     {
       "parameters": {
@@ -165,7 +184,9 @@
       "name": "PHI Response",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [1760, 300]
+      "position": [1760, 300],
+      "notes": "EXIT POINT: Returns the PHI operation result to the caller.\nCustom response headers:\n- X-PHI-Processing: LOCAL_ONLY\n- X-Compliance: HIPAA_COMPLIANT\n- X-Audit-Id: unique audit trail reference for this operation\n\nThe response body contains the operation result (redacted text or classification)\nbut never the original unredacted PHI data.",
+      "notesInFlow": true
     }
   ],
   "connections": {
