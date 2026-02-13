@@ -86,14 +86,41 @@
     },
     {
       "parameters": {
+        "method": "POST",
+        "url": "http://localhost:11434/api/generate",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"deepseek-coder-v2:latest\",\n  \"prompt\": \"You are a Neo4j Cypher query expert. Generate a single valid Cypher READ query to find data relevant to the user's medical query in a precision medicine knowledge graph.\\n\\nGraph Schema:\\n- Node labels: Gene, Drug, Condition, MedicalRecord, AuditLog, PHIAuditLog, ValidationReport\\n- Gene properties: name, symbol, chromosome, description, source, ncbi_id, data, created_at, updated_at\\n- Drug properties: name, generic_name, brand_name, mechanism, indications, drugbank_id, source, data, created_at, updated_at\\n- Condition properties: name, icd10_code, description, category, omim_id, source, data, created_at, updated_at\\n- MedicalRecord properties: name, description, source, data, type, created_at, updated_at\\n- Relationship types: RELATES_TO, TREATS, TARGETS, ASSOCIATED_WITH, INTERACTS_WITH, CAUSES, PREVENTS\\n\\nRules:\\n1. Return ONLY the Cypher query, no explanation or markdown\\n2. Always use LIMIT 20\\n3. Use toLower() for case-insensitive matching\\n4. Use CONTAINS for flexible text search\\n5. Search across relevant node labels based on the query context\\n6. Never use WRITE operations (CREATE, MERGE, DELETE, SET)\\n7. Return nodes and their relationships where possible\\n\\nUser query: {{ $json.query }}\",\n  \"stream\": false,\n  \"options\": {\n    \"temperature\": 0.1,\n    \"num_predict\": 500,\n    \"top_k\": 1,\n    \"stop\": [\"```\", \"\\n\\n\\n\"]\n  }\n}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "node-deepseek-cypher",
+      "name": "DeepSeek Generate Cypher",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1200, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const deepseekResponse = $input.first().json;\nconst queryData = $('Sanitize & Classify Input').first().json;\n\nlet cypherQuery = (deepseekResponse.response || '').trim();\n\n// Strip markdown code fences if present\ncypherQuery = cypherQuery.replace(/^```(?:cypher)?\\n?/i, '').replace(/\\n?```$/i, '').trim();\n\n// Safety: reject any write operations that slipped through\nconst writeOps = /\\b(CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|CALL\\s+\\{)\\b/i;\nif (writeOps.test(cypherQuery)) {\n  // Fallback to a safe generic read query\n  cypherQuery = `MATCH (n)\nWHERE toLower(n.name) CONTAINS toLower('${queryData.query.replace(/'/g, \"\\\\'\")}')\n   OR toLower(coalesce(n.description, '')) CONTAINS toLower('${queryData.query.replace(/'/g, \"\\\\'\")}')\nRETURN n\nLIMIT 20`;\n}\n\n// Ensure LIMIT exists\nif (!/LIMIT\\s+\\d+/i.test(cypherQuery)) {\n  cypherQuery += '\\nLIMIT 20';\n}\n\n// Validate it looks like a Cypher query\nif (!cypherQuery.toUpperCase().startsWith('MATCH') && !cypherQuery.toUpperCase().startsWith('OPTIONAL') && !cypherQuery.toUpperCase().startsWith('CALL')) {\n  // Fallback to safe generic query\n  cypherQuery = `MATCH (n)\nWHERE toLower(n.name) CONTAINS toLower('${queryData.query.replace(/'/g, \"\\\\'\")}')\n   OR toLower(coalesce(n.description, '')) CONTAINS toLower('${queryData.query.replace(/'/g, \"\\\\'\")}')\nRETURN n\nLIMIT 20`;\n}\n\nreturn [\n  {\n    json: {\n      ...queryData,\n      generated_cypher: cypherQuery,\n      cypher_generator: 'deepseek-coder-v2'\n    }\n  }\n];"
+      },
+      "id": "node-validate-cypher",
+      "name": "Validate & Sanitize Cypher",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 300]
+    },
+    {
+      "parameters": {
         "operation": "executeQuery",
-        "query": "=MATCH (r:MedicalRecord)-[:RELATES_TO]->(c:Condition)\nWHERE toLower(r.description) CONTAINS toLower('{{ $json.query }}')\n   OR toLower(c.name) CONTAINS toLower('{{ $json.query }}')\nRETURN r, c\nLIMIT 20"
+        "query": "={{ $json.generated_cypher }}"
       },
       "id": "node-neo4j-check",
-      "name": "Check Neo4j Cache",
+      "name": "Execute Dynamic Cypher",
       "type": "n8n-nodes-base.neo4j",
       "typeVersion": 1,
-      "position": [1320, 300],
+      "position": [1440, 300],
       "credentials": {
         "neo4j": {
           "id": "neo4j-cred-1",
@@ -484,7 +511,7 @@
         ],
         [
           {
-            "node": "Check Neo4j Cache",
+            "node": "DeepSeek Generate Cypher",
             "type": "main",
             "index": 0
           }
@@ -506,14 +533,36 @@
       "main": [
         [
           {
-            "node": "Check Neo4j Cache",
+            "node": "DeepSeek Generate Cypher",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Check Neo4j Cache": {
+    "DeepSeek Generate Cypher": {
+      "main": [
+        [
+          {
+            "node": "Validate & Sanitize Cypher",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Sanitize Cypher": {
+      "main": [
+        [
+          {
+            "node": "Execute Dynamic Cypher",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Dynamic Cypher": {
       "main": [
         [
           {
